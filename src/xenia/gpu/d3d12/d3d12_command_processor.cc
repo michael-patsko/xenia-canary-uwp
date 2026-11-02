@@ -19,6 +19,7 @@
 #include "xenia/emulator.h"
 #include "xenia/gpu/d3d12/d3d12_graphics_system.h"
 #include "xenia/gpu/d3d12/d3d12_shader.h"
+#include "xenia/gpu/diag_dump.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/packet_disassembler.h"
@@ -44,9 +45,20 @@ DEFINE_bool(d3d12_clear_memory_page_state, true,
 
 DECLARE_bool(clear_memory_page_state);
 
+DEFINE_int32(diag_frame_dump_interval, 600,
+             "Diagnostic (harms-way-diag): log every draw, resolve and render "
+             "target transfer of every Nth guest frame. 0 disables.",
+             "D3D12");
+DEFINE_int32(diag_frame_dump_max, 40,
+             "Diagnostic (harms-way-diag): maximum number of frames to dump.",
+             "D3D12");
+
 namespace xe {
 namespace gpu {
 namespace d3d12 {
+
+// Number of diagnostic frame dumps done so far.
+static uint32_t diag_frame_dumps_done = 0;
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -2523,6 +2535,92 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
                                       uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info,
                                       bool major_mode_explicit) {
+  if (!diag::frame_dump_active) {
+    return IssueDrawImpl(primitive_type, index_count, index_buffer_info,
+                         major_mode_explicit);
+  }
+  // Diagnostic frame dump (harms-way-diag): capture the guest state, run the
+  // draw or copy, then log what happened to it.
+  const RegisterFile& regs = *register_file_;
+  uint32_t diag_event = diag::frame_dump_event++;
+  bool diag_is_copy = regs.Get<reg::RB_MODECONTROL>().edram_mode ==
+                      xenos::EdramMode::kCopy;
+  Shader* diag_vs = active_vertex_shader();
+  Shader* diag_ps = active_pixel_shader();
+  uint64_t diag_vs_hash = diag_vs ? diag_vs->ucode_data_hash() : 0;
+  uint64_t diag_ps_hash = diag_ps ? diag_ps->ucode_data_hash() : 0;
+  uint32_t r_surface = regs[XE_GPU_REG_RB_SURFACE_INFO];
+  uint32_t r_mode = regs[XE_GPU_REG_RB_MODECONTROL];
+  uint32_t r_c0 = regs[XE_GPU_REG_RB_COLOR_INFO];
+  uint32_t r_c1 = regs[XE_GPU_REG_RB_COLOR1_INFO];
+  uint32_t r_c2 = regs[XE_GPU_REG_RB_COLOR2_INFO];
+  uint32_t r_c3 = regs[XE_GPU_REG_RB_COLOR3_INFO];
+  uint32_t r_z = regs[XE_GPU_REG_RB_DEPTH_INFO];
+  uint32_t r_zctl = regs[XE_GPU_REG_RB_DEPTHCONTROL];
+  uint32_t r_cmask = regs[XE_GPU_REG_RB_COLOR_MASK];
+  uint32_t r_blend0 = regs[XE_GPU_REG_RB_BLENDCONTROL0];
+  uint32_t r_clip = regs[XE_GPU_REG_PA_CL_CLIP_CNTL];
+  uint32_t r_scmode = regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL];
+  uint32_t r_vte = regs[XE_GPU_REG_PA_CL_VTE_CNTL];
+  uint32_t r_wofs = regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET];
+  uint32_t r_wsc_tl = regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL];
+  uint32_t r_wsc_br = regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR];
+  uint32_t r_ssc_tl = regs[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_TL];
+  uint32_t r_ssc_br = regs[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR];
+  uint32_t r_copy_ctl = regs[XE_GPU_REG_RB_COPY_CONTROL];
+  uint32_t r_copy_base = regs[XE_GPU_REG_RB_COPY_DEST_BASE];
+  uint32_t r_copy_pitch = regs[XE_GPU_REG_RB_COPY_DEST_PITCH];
+  uint32_t r_copy_info = regs[XE_GPU_REG_RB_COPY_DEST_INFO];
+  uint32_t r_depth_clear = regs[XE_GPU_REG_RB_DEPTH_CLEAR];
+  diag_draw_stage_ = "entry";
+  diag_host_vertex_count_ = 0;
+  diag_host_primitive_type_ = 0;
+  bool result = IssueDrawImpl(primitive_type, index_count, index_buffer_info,
+                              major_mode_explicit);
+  if (diag_is_copy) {
+    XELOGI(
+        "DIAG {}.{} COPY ctl={:08X} dest_base={:08X} dest_pitch={:08X} "
+        "dest_info={:08X} surf={:08X} c0={:08X} z={:08X} zclear={:08X} "
+        "wofs={:08X} -> {}",
+        diag::frame_dump_frame, diag_event, r_copy_ctl, r_copy_base,
+        r_copy_pitch, r_copy_info, r_surface, r_c0, r_z, r_depth_clear, r_wofs,
+        result ? "ok" : "FAILED");
+    return result;
+  }
+  XELOGI(
+      "DIAG {}.{} DRAW vs={:016X} ps={:016X} prim={} n={} surf={:08X} "
+      "mode={:08X} c0={:08X} c1={:08X} c2={:08X} c3={:08X} z={:08X} "
+      "zctl={:08X} cmask={:08X} blend0={:08X} -> {} stage={} hostverts={} "
+      "hostprim={}",
+      diag::frame_dump_frame, diag_event, diag_vs_hash, diag_ps_hash,
+      uint32_t(primitive_type), index_count, r_surface, r_mode, r_c0, r_c1,
+      r_c2, r_c3, r_z, r_zctl, r_cmask, r_blend0, result ? "ok" : "FAILED",
+      diag_draw_stage_, diag_host_vertex_count_, diag_host_primitive_type_);
+  if (result && std::strcmp(diag_draw_stage_, "submitted") == 0) {
+    XELOGI(
+        "DIAG {}.{}   clip={:08X} scmode={:08X} vte={:08X} wofs={:08X} "
+        "wsc={:08X},{:08X} ssc={:08X},{:08X} vp={},{} {}x{} z={:.5f}..{:.5f} "
+        "sc={},{} {}x{} rt=[z {:08X} c {:08X} {:08X} {:08X} {:08X}]",
+        diag::frame_dump_frame, diag_event, r_clip, r_scmode, r_vte, r_wofs,
+        r_wsc_tl, r_wsc_br, r_ssc_tl, r_ssc_br,
+        diag_viewport_info_.xy_offset[0], diag_viewport_info_.xy_offset[1],
+        diag_viewport_info_.xy_extent[0], diag_viewport_info_.xy_extent[1],
+        diag_viewport_info_.z_min, diag_viewport_info_.z_max,
+        diag_scissor_.offset[0], diag_scissor_.offset[1],
+        diag_scissor_.extent[0], diag_scissor_.extent[1],
+        render_target_cache_->DiagLastUpdateUsedRenderTargetKey(0),
+        render_target_cache_->DiagLastUpdateUsedRenderTargetKey(1),
+        render_target_cache_->DiagLastUpdateUsedRenderTargetKey(2),
+        render_target_cache_->DiagLastUpdateUsedRenderTargetKey(3),
+        render_target_cache_->DiagLastUpdateUsedRenderTargetKey(4));
+  }
+  return result;
+}
+
+bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type,
+                                          uint32_t index_count,
+                                          IndexBufferInfo* index_buffer_info,
+                                          bool major_mode_explicit) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -2533,9 +2631,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
+    diag_draw_stage_ = "copy";
     return IssueCopy();
   }
 
+  diag_draw_stage_ = "pitch0";
   if (regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0) {
     // Doesn't actually draw.
     // TODO(Triang3l): Do something so memexport still works in this case maybe?
@@ -2544,6 +2644,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   }
 
   // Vertex shader analysis.
+  diag_draw_stage_ = "no-vertex-shader";
   auto vertex_shader = static_cast<D3D12Shader*>(active_vertex_shader());
   if (!vertex_shader) {
     // Always need a vertex shader.
@@ -2576,6 +2677,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     // cache.
     if (!memexport_used_vertex) {
       // This draw has no effect.
+      diag_draw_stage_ = "no-rasterization";
       return true;
     }
   }
@@ -2584,15 +2686,21 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   const bool memexport_used = memexport_used_vertex || memexport_used_pixel;
 
+  diag_draw_stage_ = "begin-submission";
   if (!BeginSubmission(true)) {
     return false;
   }
 
   // Process primitives.
+  diag_draw_stage_ = "primitive-processor";
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
   if (!primitive_processor_->Process(primitive_processing_result)) {
     return false;
   }
+  diag_host_vertex_count_ = primitive_processing_result.host_draw_vertex_count;
+  diag_host_primitive_type_ =
+      uint32_t(primitive_processing_result.host_primitive_type);
+  diag_draw_stage_ = "zero-host-vertices";
   if (!primitive_processing_result.host_draw_vertex_count) {
     // Nothing to draw.
     return true;
@@ -2624,6 +2732,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       pixel_shader ? draw_util::GetNormalizedColorMask(
                          regs, pixel_shader->writes_color_targets())
                    : 0;
+  diag_draw_stage_ = "render-target-update";
   if (!render_target_cache_->Update(is_rasterization_done,
                                     normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
@@ -2657,6 +2766,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   }
   void* pipeline_handle;
   ID3D12RootSignature* root_signature;
+  diag_draw_stage_ = "configure-pipeline";
   if (!pipeline_cache_->ConfigurePipeline(
           vertex_shader_translation, pixel_shader_translation,
           primitive_processing_result, normalized_depth_control,
@@ -2724,6 +2834,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   // Update viewport, scissor, blend factor and stencil reference.
   UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal,
                            normalized_depth_control);
+  diag_viewport_info_ = viewport_info;
+  diag_scissor_ = scissor;
 
   // Update system constants before uploading them.
   // TODO(Triang3l): With ROV, pass the disabled render target mask for safety.
@@ -2734,10 +2846,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       used_texture_mask, normalized_depth_control, normalized_color_mask);
 
   // Update constant buffers, descriptors and root parameters.
+  diag_draw_stage_ = "update-bindings";
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature,
                       memexport_used)) {
     return false;
   }
+  diag_draw_stage_ = "vertex-fetch";
   // Must not call anything that can change the descriptor heap from now on!
 
   // Ensure vertex buffers are resident.
@@ -2808,6 +2922,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   // Gather memexport ranges and ensure the heaps for them are resident, and
   // also load the data surrounding the export and to fill the regions that
   // won't be modified by the shaders.
+  diag_draw_stage_ = "memexport-range";
   memexport_ranges_.clear();
   if (memexport_used_vertex) {
     draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
@@ -2826,6 +2941,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     }
   }
   // Primitive topology.
+  diag_draw_stage_ = "topology";
   D3D_PRIMITIVE_TOPOLOGY primitive_topology;
   if (primitive_processing_result.IsTessellated()) {
     switch (primitive_processing_result.host_primitive_type) {
@@ -2892,6 +3008,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   // Must not call anything that may change the primitive topology from now on!
 
   // Draw.
+  diag_draw_stage_ = "index-buffer";
   if (primitive_processing_result.index_buffer_type ==
       PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
     if (!memexport_used) {
@@ -3034,6 +3151,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     }
   }
 
+  diag_draw_stage_ = "submitted";
   return true;
 }
 
@@ -3537,6 +3655,25 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kQueueFrames] =
         GetCurrentSubmission() - 1;
+
+    // Diagnostic frame dump (harms-way-diag): close the dumped frame, and
+    // decide whether to dump the next one.
+    if (diag::frame_dump_active) {
+      XELOGI("DIAG frame {} end ({} draws and copies)",
+             diag::frame_dump_frame, diag::frame_dump_event);
+      diag::frame_dump_active = false;
+    }
+    if (cvars::diag_frame_dump_interval > 0 &&
+        int64_t(diag_frame_dumps_done) <
+            int64_t(cvars::diag_frame_dump_max) &&
+        frame_current_ % uint64_t(cvars::diag_frame_dump_interval) == 0) {
+      ++diag_frame_dumps_done;
+      diag::frame_dump_active = true;
+      diag::frame_dump_frame = frame_current_;
+      diag::frame_dump_event = 0;
+      XELOGI("DIAG frame {} begin (dump {} of {})", frame_current_,
+             diag_frame_dumps_done, cvars::diag_frame_dump_max);
+    }
 
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
       cache_clear_requested_ = false;

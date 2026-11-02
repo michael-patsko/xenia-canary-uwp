@@ -23,6 +23,7 @@
 #include "xenia/gpu/d3d12/d3d12_command_processor.h"
 #include "xenia/gpu/d3d12/d3d12_texture_cache.h"
 #include "xenia/gpu/d3d12/deferred_command_list.h"
+#include "xenia/gpu/diag_dump.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/dxbc.h"
 #include "xenia/gpu/dxbc_shader_translator.h"
@@ -1339,7 +1340,29 @@ bool D3D12RenderTargetCache::Resolve(const Memory& memory,
           register_file(), memory, trace_writer_, draw_resolution_scale_x(),
           draw_resolution_scale_y(), fixed_16_truncated_to_minus_1_to_1,
           fixed_16_truncated_to_minus_1_to_1, resolve_info)) {
+    if (diag::frame_dump_active) {
+      XELOGI("DIAG {}   RESOLVE GetResolveInfo failed", diag::frame_dump_frame);
+    }
     return false;
+  }
+
+  if (diag::frame_dump_active) {
+    XELOGI(
+        "DIAG {}   RESOLVE copy_ctl={:08X} depth={} depth_edram={:08X} "
+        "color_edram={:08X} depth_base={} color_base={} coord={:08X} "
+        "h_div_8={} dest_info={:08X} dest_coord={:08X} dest_base={:08X} "
+        "dest_extent={:08X}+{:08X} depth_clear={:08X} color_clear={:08X}",
+        diag::frame_dump_frame, resolve_info.rb_copy_control.value,
+        resolve_info.IsCopyingDepth() ? 1 : 0,
+        resolve_info.depth_edram_info.packed,
+        resolve_info.color_edram_info.packed,
+        resolve_info.depth_original_base, resolve_info.color_original_base,
+        resolve_info.coordinate_info.packed, resolve_info.height_div_8,
+        resolve_info.copy_dest_info.value,
+        resolve_info.copy_dest_coordinate_info.packed,
+        resolve_info.copy_dest_base, resolve_info.copy_dest_extent_start,
+        resolve_info.copy_dest_extent_length, resolve_info.rb_depth_clear,
+        resolve_info.rb_color_clear);
   }
 
   // Nothing to copy/clear.
@@ -4353,10 +4376,15 @@ D3D12RenderTargetCache::GetOrCreateTransferPipelines(TransferShaderKey key) {
     bool stencil_pipelines_created = true;
     for (uint32_t i = 0; i < 8; ++i) {
       pipeline_desc.DepthStencilState.StencilWriteMask = UINT8(1) << i;
-      if (SUCCEEDED(device->CreateGraphicsPipelineState(
-              &pipeline_desc, IID_PPV_ARGS(&stencil_bit_pipelines[i])))) {
+      HRESULT diag_stencil_bit_result = device->CreateGraphicsPipelineState(
+          &pipeline_desc, IID_PPV_ARGS(&stencil_bit_pipelines[i]));
+      if (SUCCEEDED(diag_stencil_bit_result)) {
         continue;
       }
+      XELOGE(
+          "DIAG failed to create a render target transfer stencil bit "
+          "pipeline: shaderkey={:08X} mode={} bit={} hresult={:08X}",
+          key.key, uint32_t(key.mode), i, uint32_t(diag_stencil_bit_result));
       stencil_pipelines_created = false;
       for (uint32_t j = 0; j < i; ++j) {
         stencil_bit_pipelines[j]->Release();
@@ -4400,8 +4428,14 @@ D3D12RenderTargetCache::GetOrCreateTransferPipelines(TransferShaderKey key) {
       pipeline_desc.DSVFormat = GetDepthDSVDXGIFormat(dest_depth_format);
     }
     ID3D12PipelineState* pipeline;
-    if (FAILED(device->CreateGraphicsPipelineState(&pipeline_desc,
-                                                   IID_PPV_ARGS(&pipeline)))) {
+    HRESULT diag_pipeline_result = device->CreateGraphicsPipelineState(
+        &pipeline_desc, IID_PPV_ARGS(&pipeline));
+    if (FAILED(diag_pipeline_result)) {
+      XELOGE(
+          "DIAG failed to create a render target transfer pipeline: "
+          "shaderkey={:08X} mode={} dest_color={} hresult={:08X}",
+          key.key, uint32_t(key.mode), dest_is_color ? 1 : 0,
+          uint32_t(diag_pipeline_result));
       pipeline = nullptr;
     }
     // Even if creation fails, still store the null pointer not to try to create
@@ -5010,6 +5044,17 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         auto* host_depth_source_d3d12_rt =
             static_cast<D3D12RenderTarget*>(it->transfer.host_depth_source);
         TransferShaderKey transfer_shader_key = it->shader_key;
+        if (diag::frame_dump_active) {
+          XELOGI(
+              "DIAG {}   TRANSFER dest={:08X} src={:08X} hostdepthsrc={:08X} "
+              "mode={} shaderkey={:08X} rects={}",
+              diag::frame_dump_frame, dest_rt_key.key, source_d3d12_rt.key().key,
+              host_depth_source_d3d12_rt
+                  ? host_depth_source_d3d12_rt->key().key
+                  : uint32_t(0),
+              uint32_t(transfer_shader_key.mode), transfer_shader_key.key,
+              transfer_rectangle_count);
+        }
         const TransferModeInfo& transfer_mode_info =
             kTransferModes[size_t(transfer_shader_key.mode)];
         TransferRootSignatureIndex transfer_root_signature_index =
@@ -5055,6 +5100,15 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
                 sizeof(float), nullptr, nullptr,
                 &transfer_rectangle_buffer_view.BufferLocation));
         if (!transfer_rectangle_write_ptr) {
+          static uint32_t diag_no_vertex_buffer_logs = 0;
+          if (diag_no_vertex_buffer_logs < 64) {
+            ++diag_no_vertex_buffer_logs;
+            XELOGE(
+                "DIAG transfer skipped - no vertex buffer: dest={:08X} "
+                "src={:08X} shaderkey={:08X}",
+                dest_rt_key.key, source_d3d12_rt.key().key,
+                transfer_shader_key.key);
+          }
           continue;
         }
         for (auto it_merged = it_merged_first; it_merged <= it_merged_last;
@@ -5120,6 +5174,15 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         ID3D12PipelineState* const* transfer_pipelines =
             GetOrCreateTransferPipelines(transfer_shader_key);
         if (!transfer_pipelines) {
+          static uint32_t diag_no_transfer_pipeline_logs = 0;
+          if (diag_no_transfer_pipeline_logs < 64) {
+            ++diag_no_transfer_pipeline_logs;
+            XELOGE(
+                "DIAG transfer skipped - no pipeline: dest={:08X} src={:08X} "
+                "mode={} shaderkey={:08X}",
+                dest_rt_key.key, source_d3d12_rt.key().key,
+                uint32_t(transfer_shader_key.mode), transfer_shader_key.key);
+          }
           continue;
         }
         if (last_transfer_root_signature_index !=

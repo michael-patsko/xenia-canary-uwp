@@ -224,6 +224,19 @@ class RenderTargetCache {
       bool distinguish_gamma_formats,
       uint32_t* depth_and_color_formats_out = nullptr) const;
 
+  // Diagnostic (harms-way-diag): packed RenderTargetKey of the render target
+  // used by the draw with the last successful update, 0 being depth and 1...4
+  // color, or 0 if none is bound. Host render target path only.
+  uint32_t DiagLastUpdateUsedRenderTargetKey(uint32_t index) const {
+    if (GetPath() != Path::kHostRenderTargets ||
+        index > xenos::kMaxColorRenderTargets) {
+      return 0;
+    }
+    const RenderTarget* render_target =
+        last_update_used_render_targets_[index];
+    return render_target ? render_target->key().key : 0;
+  }
+
  protected:
   RenderTargetCache(const RegisterFile& register_file, const Memory& memory,
                     TraceWriter* trace_writer, uint32_t draw_resolution_scale_x,

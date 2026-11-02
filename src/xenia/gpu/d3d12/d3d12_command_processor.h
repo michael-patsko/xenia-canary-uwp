@@ -332,6 +332,18 @@ class D3D12CommandProcessor final : public CommandProcessor {
   void InitializeTrace() override;
 
  private:
+  // The original IssueDraw; IssueDraw wraps it to log draws in diagnostic
+  // frame dumps (harms-way-diag).
+  bool IssueDrawImpl(xenos::PrimitiveType primitive_type, uint32_t index_count,
+                     IndexBufferInfo* index_buffer_info,
+                     bool major_mode_explicit);
+  // Last stage IssueDrawImpl reached, for diagnostic frame dumps.
+  const char* diag_draw_stage_ = "";
+  uint32_t diag_host_vertex_count_ = 0;
+  uint32_t diag_host_primitive_type_ = 0;
+  draw_util::ViewportInfo diag_viewport_info_ = {};
+  draw_util::Scissor diag_scissor_ = {};
+
   static constexpr uint32_t kQueueFrames = 3;
 
   enum RootParameter : UINT {
