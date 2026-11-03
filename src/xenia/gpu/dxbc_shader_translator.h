@@ -661,6 +661,9 @@ class DxbcShaderTranslator : public ShaderTranslator {
                GetDxbcShaderModification().vertex.host_vertex_shader_type);
   }
 
+  // dxbc_no_coverage_with_depth: no SV_Coverage output (no alpha to coverage)
+  // in pixel shaders that write depth, on the host render target path.
+  bool IsCoverageOutputSkippedForDepth() const;
   bool IsForceEarlyDepthStencilGlobalFlagEnabled() const {
     return is_pixel_shader() &&
            GetDxbcShaderModification().pixel.depth_stencil_mode ==

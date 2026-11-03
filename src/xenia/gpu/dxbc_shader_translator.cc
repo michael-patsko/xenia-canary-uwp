@@ -37,6 +37,12 @@ DEFINE_bool(dxbc_switch, false,
             "HD Graphics, this is ignored because of a crash with the switch "
             "instruction.",
             "GPU");
+DEFINE_bool(dxbc_no_coverage_with_depth, false,
+            "Don't output SV_Coverage (used for alpha to coverage) from pixel "
+            "shaders that write depth, in case the host driver loses the depth "
+            "when both are exported (harms-way-diag: Harm's Way depth restore "
+            "pass on the Xbox Series S).",
+            "GPU");
 DEFINE_bool(dxbc_source_map, false,
             "Disassemble Xenos instructions as comments in the resulting DXBC "
             "for debugging.",
@@ -45,6 +51,11 @@ DEFINE_bool(dxbc_source_map, false,
 namespace xe {
 namespace gpu {
 using namespace ucode;
+
+bool DxbcShaderTranslator::IsCoverageOutputSkippedForDepth() const {
+  return cvars::dxbc_no_coverage_with_depth && is_pixel_shader() &&
+         !edram_rov_used_ && current_shader().writes_depth();
+}
 
 // Notes about operands:
 //
@@ -3326,7 +3337,8 @@ void DxbcShaderTranslator::WriteOutputSignature() {
       // Coverage output for alpha to mask (SV_Coverage).
       size_t coverage_position = SIZE_MAX;
       if ((color_targets_written & 0b1) &&
-          !IsForceEarlyDepthStencilGlobalFlagEnabled()) {
+          !IsForceEarlyDepthStencilGlobalFlagEnabled() &&
+          !IsCoverageOutputSkippedForDepth()) {
         coverage_position = shader_object_.size();
         shader_object_.resize(shader_object_.size() + kParameterDwords);
         ++parameter_count;
@@ -3744,7 +3756,8 @@ void DxbcShaderTranslator::WriteShaderCode() {
       }
       // Coverage output for alpha to mask.
       if ((color_targets_written & 0b1) &&
-          !global_flag_force_early_depth_stencil) {
+          !global_flag_force_early_depth_stencil &&
+          !IsCoverageOutputSkippedForDepth()) {
         ao_.OpDclOutput(dxbc::Dest::OMask());
       }
       // Depth output.
