@@ -8,11 +8,15 @@
  */
 
 #include "xenia/gpu/d3d12/d3d12_command_processor.h"
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <unordered_set>
 #include "xenia/apu/audio_system.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
@@ -52,6 +56,21 @@ DEFINE_int32(diag_frame_dump_interval, 600,
 DEFINE_int32(diag_frame_dump_max, 40,
              "Diagnostic (harms-way-diag): maximum number of frames to dump.",
              "D3D12");
+DEFINE_int32(diag_resolve_capture_frames, 2,
+             "Diagnostic (harms-way-diag): number of frames in which every "
+             "resolve result is read back and saved to LocalState\\diag, "
+             "along with a full frame dump in the log. 0 disables.",
+             "D3D12");
+DEFINE_int32(diag_resolve_capture_interval, 300,
+             "Diagnostic (harms-way-diag): capture the frame after every Nth "
+             "frame that contained a 2x MSAA draw.",
+             "D3D12");
+DEFINE_int32(diag_resolve_capture_max_mb, 256,
+             "Diagnostic (harms-way-diag): stop saving resolve captures after "
+             "this many megabytes in total.",
+             "D3D12");
+
+DECLARE_bool(d3d12_debug);
 
 namespace xe {
 namespace gpu {
@@ -59,6 +78,9 @@ namespace d3d12 {
 
 // Number of diagnostic frame dumps done so far.
 static uint32_t diag_frame_dumps_done = 0;
+// Number of resolve capture frames started, and of frames with 2x MSAA draws.
+static uint32_t diag_resolve_captures_done = 0;
+static uint64_t diag_frames_with_2x = 0;
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -2535,6 +2557,17 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
                                       uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info,
                                       bool major_mode_explicit) {
+  {
+    // Note frames that draw at 2x MSAA (the Harm's Way race scene), to pick
+    // the frames for resolve capture.
+    const RegisterFile& diag_regs = *register_file_;
+    if (diag_regs.Get<reg::RB_SURFACE_INFO>().msaa_samples ==
+            xenos::MsaaSamples::k2X &&
+        diag_regs.Get<reg::RB_MODECONTROL>().edram_mode !=
+            xenos::EdramMode::kCopy) {
+      diag_frame_has_2x_draw_ = true;
+    }
+  }
   if (!diag::frame_dump_active) {
     return IssueDrawImpl(primitive_type, index_count, index_buffer_info,
                          major_mode_explicit);
@@ -2613,6 +2646,34 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
         render_target_cache_->DiagLastUpdateUsedRenderTargetKey(2),
         render_target_cache_->DiagLastUpdateUsedRenderTargetKey(3),
         render_target_cache_->DiagLastUpdateUsedRenderTargetKey(4));
+  }
+  if (diag_ps) {
+    // Raw texture fetch constants of the pixel shader's textures, to tell which
+    // resolved surfaces each draw reads.
+    const std::vector<Shader::TextureBinding>& diag_bindings =
+        diag_ps->texture_bindings();
+    if (!diag_bindings.empty()) {
+      std::string diag_tex;
+      uint32_t diag_fetch_constants_logged = 0;
+      for (const Shader::TextureBinding& binding : diag_bindings) {
+        uint32_t fetch_constant = binding.fetch_constant;
+        if (fetch_constant >= 32 ||
+            (diag_fetch_constants_logged & (uint32_t(1) << fetch_constant))) {
+          continue;
+        }
+        diag_fetch_constants_logged |= uint32_t(1) << fetch_constant;
+        uint32_t fetch_reg =
+            uint32_t(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) +
+            fetch_constant * 6;
+        diag_tex += fmt::format(
+            " tf{}=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+            fetch_constant, regs[fetch_reg], regs[fetch_reg + 1],
+            regs[fetch_reg + 2], regs[fetch_reg + 3], regs[fetch_reg + 4],
+            regs[fetch_reg + 5]);
+      }
+      XELOGI("DIAG {}.{}   TEX{}", diag::frame_dump_frame, diag_event,
+             diag_tex);
+    }
   }
   return result;
 }
@@ -3177,6 +3238,155 @@ void D3D12CommandProcessor::InitializeTrace() {
   }
 }
 
+void D3D12CommandProcessor::DiagCaptureResolve(uint32_t written_address,
+                                               uint32_t written_length) {
+  // IssueDraw has already advanced the event counter for this copy.
+  uint32_t event = diag::frame_dump_event ? diag::frame_dump_event - 1 : 0;
+  if (!written_length) {
+    XELOGI("DIAG {}.{} CAPTURE skipped: the resolve wrote nothing",
+           diag::frame_dump_frame, event);
+    return;
+  }
+  uint64_t cap_bytes =
+      uint64_t(std::max(cvars::diag_resolve_capture_max_mb, int32_t(0)))
+      << 20;
+  if (diag_capture_bytes_ + written_length > cap_bytes) {
+    XELOGI("DIAG {}.{} CAPTURE skipped: the {} MB cap is reached",
+           diag::frame_dump_frame, event, cvars::diag_resolve_capture_max_mb);
+    return;
+  }
+  if (written_length > diag_readback_buffer_size_) {
+    const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+    ID3D12Device* device = provider.GetDevice();
+    uint32_t size = xe::align(written_length, uint32_t(1) << 20);
+    D3D12_RESOURCE_DESC buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(buffer_desc, size,
+                                            D3D12_RESOURCE_FLAG_NONE);
+    ID3D12Resource* buffer;
+    if (FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesReadback,
+            provider.GetHeapFlagCreateNotZeroed(), &buffer_desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)))) {
+      XELOGE("DIAG {}.{} CAPTURE failed: no {} MB readback buffer",
+             diag::frame_dump_frame, event, size >> 20);
+      return;
+    }
+    if (diag_readback_buffer_) {
+      diag_readback_buffer_->Release();
+    }
+    diag_readback_buffer_ = buffer;
+    diag_readback_buffer_size_ = size;
+  }
+  // Copy the written range of shared memory and wait for it, without writing
+  // anything back to guest memory, so the capture doesn't change what the game
+  // sees.
+  shared_memory_->UseAsCopySource();
+  SubmitBarriers();
+  deferred_command_list_.D3DCopyBufferRegion(
+      diag_readback_buffer_, 0, shared_memory_->GetBuffer(), written_address,
+      written_length);
+  if (!AwaitAllQueueOperationsCompletion()) {
+    XELOGE("DIAG {}.{} CAPTURE failed: awaiting the GPU",
+           diag::frame_dump_frame, event);
+    return;
+  }
+  D3D12_RANGE read_range;
+  read_range.Begin = 0;
+  read_range.End = written_length;
+  void* mapping;
+  if (FAILED(diag_readback_buffer_->Map(0, &read_range, &mapping))) {
+    XELOGE("DIAG {}.{} CAPTURE failed: Map", diag::frame_dump_frame, event);
+    return;
+  }
+  // Statistics of the 32-bit words as the guest reads them (big-endian).
+  const uint32_t* words = static_cast<const uint32_t*>(mapping);
+  size_t word_count = written_length / sizeof(uint32_t);
+  uint32_t first = word_count ? xe::byte_swap(words[0]) : 0;
+  uint32_t word_min = UINT32_MAX, word_max = 0;
+  size_t same_as_first = 0;
+  constexpr size_t kDistinctCap = 65536;
+  std::unordered_set<uint32_t> distinct;
+  for (size_t i = 0; i < word_count; ++i) {
+    uint32_t word = xe::byte_swap(words[i]);
+    if (word == first) {
+      ++same_as_first;
+    }
+    word_min = std::min(word_min, word);
+    word_max = std::max(word_max, word);
+    if (distinct.size() < kDistinctCap) {
+      distinct.insert(word);
+    }
+  }
+  std::filesystem::path folder = xe::filesystem::GetUserFolder() / "diag";
+  if (!diag_capture_folder_created_) {
+    xe::filesystem::CreateFolder(folder);
+    diag_capture_folder_created_ = true;
+  }
+  std::string file_name =
+      fmt::format("f{}_e{}_{:08X}_{:X}.bin", diag::frame_dump_frame, event,
+                  written_address, written_length);
+  bool file_written = false;
+  FILE* file = xe::filesystem::OpenFile(folder / file_name, "wb");
+  if (file) {
+    file_written =
+        std::fwrite(mapping, 1, written_length, file) == written_length;
+    std::fclose(file);
+  }
+  D3D12_RANGE write_range = {};
+  diag_readback_buffer_->Unmap(0, &write_range);
+  if (file_written) {
+    diag_capture_bytes_ += written_length;
+  }
+  XELOGI(
+      "DIAG {}.{} CAPTURE addr={:08X} len={:X} words={} distinct={}{} "
+      "same_as_first={:.4f} first={:08X} min={:08X} max={:08X} file={}",
+      diag::frame_dump_frame, event, written_address, written_length,
+      word_count, distinct.size(), distinct.size() >= kDistinctCap ? "+" : "",
+      word_count ? double(same_as_first) / double(word_count) : 0.0, first,
+      word_min, word_max,
+      file_written ? file_name : std::string("(write failed)"));
+}
+
+void D3D12CommandProcessor::DiagDrainD3D12Messages() {
+  constexpr uint32_t kMaxMessages = 2000;
+  if (!cvars::d3d12_debug || diag_d3d12_messages_logged_ >= kMaxMessages) {
+    return;
+  }
+  ID3D12InfoQueue* info_queue = nullptr;
+  if (FAILED(GetD3D12Provider().GetDevice()->QueryInterface(
+          IID_PPV_ARGS(&info_queue)))) {
+    if (!diag_d3d12_info_queue_missing_logged_) {
+      diag_d3d12_info_queue_missing_logged_ = true;
+      XELOGI("DIAG D3D12 info queue unavailable (no debug layer)");
+    }
+    return;
+  }
+  UINT64 message_count = info_queue->GetNumStoredMessages();
+  for (UINT64 i = 0;
+       i < message_count && diag_d3d12_messages_logged_ < kMaxMessages; ++i) {
+    SIZE_T message_size = 0;
+    if (FAILED(info_queue->GetMessage(i, nullptr, &message_size)) ||
+        !message_size) {
+      continue;
+    }
+    std::vector<uint8_t> message_storage(message_size);
+    auto message = reinterpret_cast<D3D12_MESSAGE*>(message_storage.data());
+    if (FAILED(info_queue->GetMessage(i, message, &message_size))) {
+      continue;
+    }
+    XELOGI("DIAG D3D12 frame {} severity={} category={} id={} {}",
+           frame_current_, uint32_t(message->Severity),
+           uint32_t(message->Category), uint32_t(message->ID),
+           std::string_view(message->pDescription,
+                            message->DescriptionByteLength
+                                ? message->DescriptionByteLength - 1
+                                : 0));
+    ++diag_d3d12_messages_logged_;
+  }
+  info_queue->ClearStoredMessages();
+  info_queue->Release();
+}
+
 bool D3D12CommandProcessor::IssueCopy() {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
@@ -3187,9 +3397,13 @@ bool D3D12CommandProcessor::IssueCopy() {
   ReadbackResolveMode readback_mode = GetReadbackResolveMode();
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_,
-                                         *texture_cache_, written_address,
-                                         written_length);
+    bool resolved = render_target_cache_->Resolve(
+        *memory_, *shared_memory_, *texture_cache_, written_address,
+        written_length);
+    if (resolved && diag::resolve_capture_active) {
+      DiagCaptureResolve(written_address, written_length);
+    }
+    return resolved;
   } else {
     return IssueCopy_ReadbackResolvePath();
   }
@@ -3199,6 +3413,9 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint32_t written_address, written_length;
   if (render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
                                     written_address, written_length)) {
+    if (diag::resolve_capture_active) {
+      DiagCaptureResolve(written_address, written_length);
+    }
     if (!texture_cache_->IsDrawResolutionScaled() && written_length) {
       // Early check: if destination memory is not accessible, skip all the
       // expensive GPU readback work.
@@ -3662,17 +3879,43 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       XELOGI("DIAG frame {} end ({} draws and copies)",
              diag::frame_dump_frame, diag::frame_dump_event);
       diag::frame_dump_active = false;
+      diag::resolve_capture_active = false;
     }
-    if (cvars::diag_frame_dump_interval > 0 &&
+    DiagDrainD3D12Messages();
+    bool diag_had_2x = diag_frame_has_2x_draw_;
+    diag_frame_has_2x_draw_ = false;
+    if (diag_had_2x) {
+      ++diag_frames_with_2x;
+    }
+    bool diag_interval_dump =
+        cvars::diag_frame_dump_interval > 0 &&
         int64_t(diag_frame_dumps_done) <
             int64_t(cvars::diag_frame_dump_max) &&
-        frame_current_ % uint64_t(cvars::diag_frame_dump_interval) == 0) {
-      ++diag_frame_dumps_done;
+        frame_current_ % uint64_t(cvars::diag_frame_dump_interval) == 0;
+    bool diag_capture =
+        diag_had_2x && cvars::diag_resolve_capture_interval > 0 &&
+        int64_t(diag_resolve_captures_done) <
+            int64_t(cvars::diag_resolve_capture_frames) &&
+        diag_frames_with_2x %
+                uint64_t(cvars::diag_resolve_capture_interval) ==
+            0;
+    if (diag_interval_dump || diag_capture) {
+      if (diag_interval_dump) {
+        ++diag_frame_dumps_done;
+      }
+      if (diag_capture) {
+        ++diag_resolve_captures_done;
+      }
       diag::frame_dump_active = true;
+      diag::resolve_capture_active = diag_capture;
       diag::frame_dump_frame = frame_current_;
       diag::frame_dump_event = 0;
-      XELOGI("DIAG frame {} begin (dump {} of {})", frame_current_,
-             diag_frame_dumps_done, cvars::diag_frame_dump_max);
+      XELOGI(
+          "DIAG frame {} begin (interval dumps {} of {}, resolve capture {}, "
+          "captures {} of {}, {} frames with 2x MSAA draws so far)",
+          frame_current_, diag_frame_dumps_done, cvars::diag_frame_dump_max,
+          diag_capture ? "yes" : "no", diag_resolve_captures_done,
+          cvars::diag_resolve_capture_frames, diag_frames_with_2x);
     }
 
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {

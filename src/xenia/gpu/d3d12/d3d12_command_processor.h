@@ -343,6 +343,18 @@ class D3D12CommandProcessor final : public CommandProcessor {
   uint32_t diag_host_primitive_type_ = 0;
   draw_util::ViewportInfo diag_viewport_info_ = {};
   draw_util::Scissor diag_scissor_ = {};
+  // Resolve capture (harms-way-diag): reads back the guest memory a resolve
+  // wrote, logs statistics of it and saves it to LocalState\diag.
+  void DiagCaptureResolve(uint32_t written_address, uint32_t written_length);
+  // With d3d12_debug, logs the debug layer messages stored since the last call.
+  void DiagDrainD3D12Messages();
+  bool diag_frame_has_2x_draw_ = false;
+  ID3D12Resource* diag_readback_buffer_ = nullptr;
+  uint32_t diag_readback_buffer_size_ = 0;
+  uint64_t diag_capture_bytes_ = 0;
+  bool diag_capture_folder_created_ = false;
+  uint32_t diag_d3d12_messages_logged_ = 0;
+  bool diag_d3d12_info_queue_missing_logged_ = false;
 
   static constexpr uint32_t kQueueFrames = 3;
 

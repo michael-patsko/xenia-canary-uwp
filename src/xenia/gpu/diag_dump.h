@@ -22,6 +22,9 @@ namespace diag {
 inline bool frame_dump_active = false;
 inline uint64_t frame_dump_frame = 0;
 inline uint32_t frame_dump_event = 0;
+// When active (only within an active frame dump), every resolve's written
+// guest memory range is read back and saved to LocalState\diag.
+inline bool resolve_capture_active = false;
 
 }  // namespace diag
 }  // namespace gpu
