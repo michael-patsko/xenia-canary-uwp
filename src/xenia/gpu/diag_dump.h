@@ -25,6 +25,8 @@ inline uint32_t frame_dump_event = 0;
 // When active (only within an active frame dump), every resolve's written
 // guest memory range is read back and saved to LocalState\diag.
 inline bool resolve_capture_active = false;
+// Number of the current guest frame (always updated, not only when dumping).
+inline uint64_t current_frame = 0;
 
 }  // namespace diag
 }  // namespace gpu

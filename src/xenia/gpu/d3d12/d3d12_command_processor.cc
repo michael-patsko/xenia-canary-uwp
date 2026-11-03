@@ -56,7 +56,7 @@ DEFINE_int32(diag_frame_dump_interval, 600,
 DEFINE_int32(diag_frame_dump_max, 40,
              "Diagnostic (harms-way-diag): maximum number of frames to dump.",
              "D3D12");
-DEFINE_int32(diag_resolve_capture_frames, 2,
+DEFINE_int32(diag_resolve_capture_frames, 1,
              "Diagnostic (harms-way-diag): number of frames in which every "
              "resolve result is read back and saved to LocalState\\diag, "
              "along with a full frame dump in the log. 0 disables.",
@@ -69,6 +69,23 @@ DEFINE_int32(diag_resolve_capture_max_mb, 256,
              "Diagnostic (harms-way-diag): stop saving resolve captures after "
              "this many megabytes in total.",
              "D3D12");
+
+DEFINE_bool(diag_hostdepth_readback, false,
+            "Diagnostic (harms-way-diag): in resolve capture frames, after a "
+            "draw whose pixel shader writes depth, read back the depth plane "
+            "of its single-sampled depth render target (froze the game once).",
+            "D3D12");
+DEFINE_bool(diag_texture_readback, true,
+            "Diagnostic (harms-way-diag): in resolve capture frames, after a "
+            "draw whose pixel shader writes depth, read back the host texture "
+            "bound to the pixel shader's first texture fetch constant.",
+            "D3D12");
+DEFINE_bool(diag_refresh_depth_textures, false,
+            "Diagnostic (harms-way-diag) workaround: before a draw whose pixel "
+            "shader writes depth, mark the memory of its depth-format textures "
+            "(k_24_8, k_24_8_FLOAT) as written by the GPU, forcing the texture "
+            "cache to reload them from the latest resolved data.",
+            "D3D12");
 
 DECLARE_bool(d3d12_debug);
 
@@ -2568,6 +2585,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       diag_frame_has_2x_draw_ = true;
     }
   }
+  if (cvars::diag_refresh_depth_textures) {
+    DiagRefreshDepthTextures();
+  }
   if (!diag::frame_dump_active) {
     return IssueDrawImpl(primitive_type, index_count, index_buffer_info,
                          major_mode_explicit);
@@ -2677,9 +2697,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   }
   if (diag::resolve_capture_active && result && diag_ps &&
       diag_ps->writes_depth()) {
-    // Read back what a depth-writing pixel shader (such as the Harm's Way
-    // depth restore pass) actually left in the host depth buffer.
-    DiagReadbackDepthAfterDraw(diag_event);
+    // Read back the texture a depth-writing pixel shader (such as the Harm's
+    // Way depth restore pass) sampled, and optionally what it left in the host
+    // depth buffer.
+    if (cvars::diag_texture_readback && !diag_ps->texture_bindings().empty()) {
+      DiagReadbackActiveTexture(diag_event,
+                                diag_ps->texture_bindings()[0].fetch_constant);
+    }
+    if (cvars::diag_hostdepth_readback) {
+      DiagReadbackDepthAfterDraw(diag_event);
+    }
   }
   return result;
 }
@@ -3379,16 +3406,37 @@ void D3D12CommandProcessor::DiagReadbackDepthAfterDraw(uint32_t event) {
            diag::frame_dump_frame, event);
     return;
   }
+  DiagReadbackResource(event, depth_resource, "HOSTDEPTH",
+                       fmt::format("hostdepth_{:08X}", depth_key));
+}
+
+void D3D12CommandProcessor::DiagReadbackActiveTexture(uint32_t event,
+                                                      uint32_t fetch_constant) {
+  ID3D12Resource* texture =
+      texture_cache_->DiagTransitionActiveTextureForCopy(fetch_constant);
+  if (!texture) {
+    XELOGI("DIAG {}.{} HOSTTEX tf{} skipped: no texture bound",
+           diag::frame_dump_frame, event, fetch_constant);
+    return;
+  }
+  DiagReadbackResource(event, texture, "HOSTTEX",
+                       fmt::format("hosttex_tf{}", fetch_constant));
+}
+
+void D3D12CommandProcessor::DiagReadbackResource(uint32_t event,
+                                                 ID3D12Resource* resource,
+                                                 const char* log_label,
+                                                 const std::string& file_label) {
   ID3D12Device* device = GetD3D12Provider().GetDevice();
-  D3D12_RESOURCE_DESC desc = depth_resource->GetDesc();
+  D3D12_RESOURCE_DESC desc = resource->GetDesc();
   D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
   UINT64 total_size = 0;
   device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr,
                                 &total_size);
   if (!total_size || total_size > (UINT64(256) << 20) ||
       !DiagEnsureReadbackBuffer(uint32_t(total_size))) {
-    XELOGE("DIAG {}.{} HOSTDEPTH failed: footprint of {} bytes",
-           diag::frame_dump_frame, event, total_size);
+    XELOGE("DIAG {}.{} {} failed: footprint of {} bytes",
+           diag::frame_dump_frame, event, log_label, total_size);
     return;
   }
   SubmitBarriers();
@@ -3397,14 +3445,14 @@ void D3D12CommandProcessor::DiagReadbackDepthAfterDraw(uint32_t event) {
   copy_dest.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
   copy_dest.PlacedFootprint = footprint;
   D3D12_TEXTURE_COPY_LOCATION copy_source;
-  copy_source.pResource = depth_resource;
+  copy_source.pResource = resource;
   copy_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
   copy_source.SubresourceIndex = 0;
   deferred_command_list_.D3DCopyTextureRegion(&copy_dest, 0, 0, 0,
                                               &copy_source, nullptr);
   if (!AwaitAllQueueOperationsCompletion()) {
-    XELOGE("DIAG {}.{} HOSTDEPTH failed: awaiting the GPU",
-           diag::frame_dump_frame, event);
+    XELOGE("DIAG {}.{} {} failed: awaiting the GPU",
+           diag::frame_dump_frame, event, log_label);
     return;
   }
   D3D12_RANGE read_range;
@@ -3412,12 +3460,12 @@ void D3D12CommandProcessor::DiagReadbackDepthAfterDraw(uint32_t event) {
   read_range.End = SIZE_T(total_size);
   void* mapping;
   if (FAILED(diag_readback_buffer_->Map(0, &read_range, &mapping))) {
-    XELOGE("DIAG {}.{} HOSTDEPTH failed: Map", diag::frame_dump_frame,
-           event);
+    XELOGE("DIAG {}.{} {} failed: Map", diag::frame_dump_frame, event,
+           log_label);
     return;
   }
-  // Statistics of the depth plane as 32-bit floats, over the rows of a 720p
-  // frame (or fewer).
+  // Statistics of the texels as 32-bit floats, over the rows of a 720p frame
+  // (or fewer).
   uint32_t width = footprint.Footprint.Width;
   uint32_t height = footprint.Footprint.Height;
   uint32_t row_pitch = footprint.Footprint.RowPitch;
@@ -3450,21 +3498,55 @@ void D3D12CommandProcessor::DiagReadbackDepthAfterDraw(uint32_t event) {
     }
   }
   std::string file_name = fmt::format(
-      "f{}_e{}_hostdepth_{:08X}_{}x{}_p{}_f{}.bin", diag::frame_dump_frame,
-      event, depth_key, width, height, row_pitch, uint32_t(format));
+      "f{}_e{}_{}_{}x{}_p{}_f{}.bin", diag::frame_dump_frame, event,
+      file_label, width, height, row_pitch, uint32_t(format));
   bool file_written =
       DiagWriteCaptureFile(file_name, mapping, size_t(total_size));
   D3D12_RANGE write_range = {};
   diag_readback_buffer_->Unmap(0, &write_range);
   XELOGI(
-      "DIAG {}.{} HOSTDEPTH key={:08X} {}x{} pitch={} format={} rows={} "
+      "DIAG {}.{} {} {} {}x{} pitch={} format={} rows={} "
       "zero_share={:.4f} min={:.6f} max={:.6f} distinct={}{} file={}",
-      diag::frame_dump_frame, event, depth_key, width, height, row_pitch,
+      diag::frame_dump_frame, event, log_label, file_label, width, height,
+      row_pitch,
       uint32_t(format), rows,
       texel_count ? double(zero_count) / double(texel_count) : 0.0,
       depth_min, depth_max, distinct.size(),
       distinct.size() >= kDistinctCap ? "+" : "",
       file_written ? file_name : std::string("(write failed)"));
+}
+
+void D3D12CommandProcessor::DiagRefreshDepthTextures() {
+  Shader* pixel_shader = active_pixel_shader();
+  if (!pixel_shader || !pixel_shader->writes_depth()) {
+    return;
+  }
+  const RegisterFile& regs = *register_file_;
+  uint32_t fetch_constants_done = 0;
+  for (const Shader::TextureBinding& binding :
+       pixel_shader->texture_bindings()) {
+    uint32_t fetch_constant = binding.fetch_constant;
+    if (fetch_constant >= 32 ||
+        (fetch_constants_done & (uint32_t(1) << fetch_constant))) {
+      continue;
+    }
+    fetch_constants_done |= uint32_t(1) << fetch_constant;
+    xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(fetch_constant);
+    if ((fetch.format != xenos::TextureFormat::k_24_8 &&
+         fetch.format != xenos::TextureFormat::k_24_8_FLOAT) ||
+        fetch.dimension != xenos::DataDimension::k2DOrStacked) {
+      continue;
+    }
+    uint32_t width = uint32_t(fetch.size_2d.width) + 1;
+    uint32_t height = uint32_t(fetch.size_2d.height) + 1;
+    uint32_t pitch = std::max(uint32_t(fetch.pitch) << 5, width);
+    uint32_t size = xe::align(pitch, uint32_t(32)) *
+                    xe::align(height, uint32_t(32)) * sizeof(uint32_t);
+    // Fires the texture cache's watches for the range (forcing a reload from
+    // the GPU copy of guest memory) and keeps the range valid.
+    shared_memory_->RangeWrittenByGpu(uint32_t(fetch.base_address) << 12,
+                                      size, true);
+  }
 }
 
 void D3D12CommandProcessor::DiagDrainD3D12Messages() {
@@ -4002,6 +4084,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       diag::resolve_capture_active = false;
     }
     DiagDrainD3D12Messages();
+    diag::current_frame = frame_current_;
     bool diag_had_2x = diag_frame_has_2x_draw_;
     diag_frame_has_2x_draw_ = false;
     if (diag_had_2x) {

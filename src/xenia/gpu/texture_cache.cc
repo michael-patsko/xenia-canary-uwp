@@ -14,6 +14,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
+#include "xenia/gpu/diag_dump.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/shared_memory.h"
 
@@ -68,6 +69,27 @@ DEFINE_bool(tiled_shared_memory, true,
 
 namespace xe {
 namespace gpu {
+
+// Diagnostic (harms-way-diag): logs loads of depth-format textures (k_24_8 and
+// k_24_8_FLOAT, such as resolved depth buffers), up to a limit.
+static uint32_t diag_depth_texture_load_lines = 0;
+static void DiagLogDepthTextureLoad(uint32_t base, uint32_t width,
+                                    uint32_t height,
+                                    xenos::TextureFormat format,
+                                    const char* stage) {
+  if (format != xenos::TextureFormat::k_24_8 &&
+      format != xenos::TextureFormat::k_24_8_FLOAT) {
+    return;
+  }
+  if (diag_depth_texture_load_lines >= 800) {
+    return;
+  }
+  ++diag_depth_texture_load_lines;
+  XELOGI("DIAG TEXLOAD frame {} event {} base={:08X} {}x{} format={} {}",
+         diag::current_frame,
+         diag::frame_dump_active ? diag::frame_dump_event : uint32_t(0), base,
+         width, height, uint32_t(format), stage);
+}
 
 const TextureCache::LoadShaderInfo
     TextureCache::load_shader_info_[kLoadShaderCount] = {
@@ -753,6 +775,9 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
     Texture& texture = *p_texture;
 
     TextureKey texture_key = texture.key();
+    DiagLogDepthTextureLoad(texture_key.base_page << 12,
+                            texture_key.GetWidth(), texture_key.GetHeight(),
+                            texture_key.format, "loading (batch)");
     // Implementation may load multiple blocks at once via accesses of up to 128
     // bits (R32G32B32A32_UINT), so aligning the size to this value to make sure
     // if the texture is small (especially if it's linear), the last blocks
@@ -816,6 +841,11 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
     }
     // reque for makeuptodatandwatch
     textures[i] = &texture;
+    DiagLogDepthTextureLoad(texture_key.base_page << 12,
+                            texture_key.GetWidth(), texture_key.GetHeight(),
+                            texture_key.format,
+                            base_resolved ? "loaded (batch, resolved)"
+                                          : "loaded (batch, not resolved)");
   }
   {
     auto crit = global_critical_region_.Acquire();
@@ -855,6 +885,9 @@ bool TextureCache::LoadTextureData(Texture& texture) {
   }
 
   TextureKey texture_key = texture.key();
+  DiagLogDepthTextureLoad(texture_key.base_page << 12, texture_key.GetWidth(),
+                          texture_key.GetHeight(), texture_key.format,
+                          "loading");
 
   // Implementation may load multiple blocks at once via accesses of up to 128
   // bits (R32G32B32A32_UINT), so aligning the size to this value to make sure
@@ -924,6 +957,10 @@ bool TextureCache::LoadTextureData(Texture& texture) {
   texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
 
   texture.LogAction("Loaded");
+  DiagLogDepthTextureLoad(texture_key.base_page << 12, texture_key.GetWidth(),
+                          texture_key.GetHeight(), texture_key.format,
+                          base_resolved ? "loaded (resolved)"
+                                        : "loaded (not resolved)");
 
   return true;
 }

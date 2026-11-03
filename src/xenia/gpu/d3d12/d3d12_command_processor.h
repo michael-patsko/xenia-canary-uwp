@@ -349,6 +349,14 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // Reads back the depth plane of the single-sampled depth render target used
   // by the last draw, logs statistics of it and saves it to LocalState\diag.
   void DiagReadbackDepthAfterDraw(uint32_t event);
+  // Reads back the host texture bound to the fetch constant, logs statistics
+  // and saves it.
+  void DiagReadbackActiveTexture(uint32_t event, uint32_t fetch_constant);
+  void DiagReadbackResource(uint32_t event, ID3D12Resource* resource,
+                            const char* log_label,
+                            const std::string& file_label);
+  // Workaround diag_refresh_depth_textures.
+  void DiagRefreshDepthTextures();
   bool DiagEnsureReadbackBuffer(uint32_t size);
   bool DiagWriteCaptureFile(const std::string& file_name, const void* data,
                             size_t size);

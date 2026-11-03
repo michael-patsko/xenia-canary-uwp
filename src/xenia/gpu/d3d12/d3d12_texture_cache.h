@@ -99,6 +99,11 @@ class D3D12TextureCache final : public TextureCache {
   // binding the actual drawing pipeline.
   void RequestTextures(uint32_t used_texture_mask) override;
 
+  // Diagnostic (harms-way-diag): transitions the unsigned host texture bound to
+  // the fetch constant to COPY_SOURCE and returns it, or returns nullptr.
+  ID3D12Resource* DiagTransitionActiveTextureForCopy(
+      uint32_t fetch_constant_index);
+
   // Returns whether texture SRV keys stored externally are still valid for the
   // current bindings and host shader binding layout. Both keys and
   // host_shader_bindings must have host_shader_binding_count elements

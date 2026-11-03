@@ -3,7 +3,7 @@
   <Identity
     Name="80beefbc-b0ca-4cc1-8193-91210a25510d"
     Publisher="CN=XeniaUWPFix"
-    Version="1.1.7.4" />
+    Version="1.1.7.5" />
   <mp:PhoneIdentity PhoneProductId="80beefbc-b0ca-4cc1-8193-91210a25510d" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
   <Properties>
     <DisplayName>xenia-canary-uwp-jump-fix</DisplayName>

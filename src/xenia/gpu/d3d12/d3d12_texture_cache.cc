@@ -476,6 +476,23 @@ void D3D12TextureCache::EndFrame() {
   }
 }
 
+ID3D12Resource* D3D12TextureCache::DiagTransitionActiveTextureForCopy(
+    uint32_t fetch_constant_index) {
+  if (fetch_constant_index >= 32) {
+    return nullptr;
+  }
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  if (!binding || !binding->texture) {
+    return nullptr;
+  }
+  auto& texture = *static_cast<D3D12Texture*>(binding->texture);
+  command_processor_.PushTransitionBarrier(
+      texture.resource(),
+      texture.SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE),
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  return texture.resource();
+}
+
 void D3D12TextureCache::RequestTextures(uint32_t used_texture_mask) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
