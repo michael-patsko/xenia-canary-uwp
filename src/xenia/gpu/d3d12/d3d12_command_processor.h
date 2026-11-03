@@ -346,6 +346,12 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // Resolve capture (harms-way-diag): reads back the guest memory a resolve
   // wrote, logs statistics of it and saves it to LocalState\diag.
   void DiagCaptureResolve(uint32_t written_address, uint32_t written_length);
+  // Reads back the depth plane of the single-sampled depth render target used
+  // by the last draw, logs statistics of it and saves it to LocalState\diag.
+  void DiagReadbackDepthAfterDraw(uint32_t event);
+  bool DiagEnsureReadbackBuffer(uint32_t size);
+  bool DiagWriteCaptureFile(const std::string& file_name, const void* data,
+                            size_t size);
   // With d3d12_debug, logs the debug layer messages stored since the last call.
   void DiagDrainD3D12Messages();
   bool diag_frame_has_2x_draw_ = false;

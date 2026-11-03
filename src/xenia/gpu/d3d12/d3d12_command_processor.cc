@@ -2675,6 +2675,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
              diag_tex);
     }
   }
+  if (diag::resolve_capture_active && result && diag_ps &&
+      diag_ps->writes_depth()) {
+    // Read back what a depth-writing pixel shader (such as the Harm's Way
+    // depth restore pass) actually left in the host depth buffer.
+    DiagReadbackDepthAfterDraw(diag_event);
+  }
   return result;
 }
 
@@ -3255,27 +3261,10 @@ void D3D12CommandProcessor::DiagCaptureResolve(uint32_t written_address,
            diag::frame_dump_frame, event, cvars::diag_resolve_capture_max_mb);
     return;
   }
-  if (written_length > diag_readback_buffer_size_) {
-    const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
-    ID3D12Device* device = provider.GetDevice();
-    uint32_t size = xe::align(written_length, uint32_t(1) << 20);
-    D3D12_RESOURCE_DESC buffer_desc;
-    ui::d3d12::util::FillBufferResourceDesc(buffer_desc, size,
-                                            D3D12_RESOURCE_FLAG_NONE);
-    ID3D12Resource* buffer;
-    if (FAILED(device->CreateCommittedResource(
-            &ui::d3d12::util::kHeapPropertiesReadback,
-            provider.GetHeapFlagCreateNotZeroed(), &buffer_desc,
-            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)))) {
-      XELOGE("DIAG {}.{} CAPTURE failed: no {} MB readback buffer",
-             diag::frame_dump_frame, event, size >> 20);
-      return;
-    }
-    if (diag_readback_buffer_) {
-      diag_readback_buffer_->Release();
-    }
-    diag_readback_buffer_ = buffer;
-    diag_readback_buffer_size_ = size;
+  if (!DiagEnsureReadbackBuffer(written_length)) {
+    XELOGE("DIAG {}.{} CAPTURE failed: no readback buffer",
+           diag::frame_dump_frame, event);
+    return;
   }
   // Copy the written range of shared memory and wait for it, without writing
   // anything back to guest memory, so the capture doesn't change what the game
@@ -3317,26 +3306,12 @@ void D3D12CommandProcessor::DiagCaptureResolve(uint32_t written_address,
       distinct.insert(word);
     }
   }
-  std::filesystem::path folder = xe::filesystem::GetUserFolder() / "diag";
-  if (!diag_capture_folder_created_) {
-    xe::filesystem::CreateFolder(folder);
-    diag_capture_folder_created_ = true;
-  }
   std::string file_name =
       fmt::format("f{}_e{}_{:08X}_{:X}.bin", diag::frame_dump_frame, event,
                   written_address, written_length);
-  bool file_written = false;
-  FILE* file = xe::filesystem::OpenFile(folder / file_name, "wb");
-  if (file) {
-    file_written =
-        std::fwrite(mapping, 1, written_length, file) == written_length;
-    std::fclose(file);
-  }
+  bool file_written = DiagWriteCaptureFile(file_name, mapping, written_length);
   D3D12_RANGE write_range = {};
   diag_readback_buffer_->Unmap(0, &write_range);
-  if (file_written) {
-    diag_capture_bytes_ += written_length;
-  }
   XELOGI(
       "DIAG {}.{} CAPTURE addr={:08X} len={:X} words={} distinct={}{} "
       "same_as_first={:.4f} first={:08X} min={:08X} max={:08X} file={}",
@@ -3344,6 +3319,151 @@ void D3D12CommandProcessor::DiagCaptureResolve(uint32_t written_address,
       word_count, distinct.size(), distinct.size() >= kDistinctCap ? "+" : "",
       word_count ? double(same_as_first) / double(word_count) : 0.0, first,
       word_min, word_max,
+      file_written ? file_name : std::string("(write failed)"));
+}
+
+bool D3D12CommandProcessor::DiagEnsureReadbackBuffer(uint32_t size) {
+  if (size <= diag_readback_buffer_size_) {
+    return diag_readback_buffer_ != nullptr;
+  }
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  uint32_t aligned_size = xe::align(size, uint32_t(1) << 20);
+  D3D12_RESOURCE_DESC buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(buffer_desc, aligned_size,
+                                          D3D12_RESOURCE_FLAG_NONE);
+  ID3D12Resource* buffer;
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback,
+          provider.GetHeapFlagCreateNotZeroed(), &buffer_desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)))) {
+    XELOGE("DIAG failed to create a {} MB readback buffer",
+           aligned_size >> 20);
+    return false;
+  }
+  if (diag_readback_buffer_) {
+    diag_readback_buffer_->Release();
+  }
+  diag_readback_buffer_ = buffer;
+  diag_readback_buffer_size_ = aligned_size;
+  return true;
+}
+
+bool D3D12CommandProcessor::DiagWriteCaptureFile(const std::string& file_name,
+                                                 const void* data,
+                                                 size_t size) {
+  std::filesystem::path folder = xe::filesystem::GetUserFolder() / "diag";
+  if (!diag_capture_folder_created_) {
+    xe::filesystem::CreateFolder(folder);
+    diag_capture_folder_created_ = true;
+  }
+  bool file_written = false;
+  FILE* file = xe::filesystem::OpenFile(folder / file_name, "wb");
+  if (file) {
+    file_written = std::fwrite(data, 1, size, file) == size;
+    std::fclose(file);
+  }
+  if (file_written) {
+    diag_capture_bytes_ += size;
+  }
+  return file_written;
+}
+
+void D3D12CommandProcessor::DiagReadbackDepthAfterDraw(uint32_t event) {
+  uint32_t depth_key =
+      render_target_cache_->DiagLastUpdateUsedRenderTargetKey(0);
+  ID3D12Resource* depth_resource =
+      render_target_cache_->DiagTransitionLastDepthForCopy();
+  if (!depth_resource) {
+    XELOGI("DIAG {}.{} HOSTDEPTH skipped: no single-sampled depth target",
+           diag::frame_dump_frame, event);
+    return;
+  }
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  D3D12_RESOURCE_DESC desc = depth_resource->GetDesc();
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+  UINT64 total_size = 0;
+  device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr,
+                                &total_size);
+  if (!total_size || total_size > (UINT64(256) << 20) ||
+      !DiagEnsureReadbackBuffer(uint32_t(total_size))) {
+    XELOGE("DIAG {}.{} HOSTDEPTH failed: footprint of {} bytes",
+           diag::frame_dump_frame, event, total_size);
+    return;
+  }
+  SubmitBarriers();
+  D3D12_TEXTURE_COPY_LOCATION copy_dest;
+  copy_dest.pResource = diag_readback_buffer_;
+  copy_dest.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  copy_dest.PlacedFootprint = footprint;
+  D3D12_TEXTURE_COPY_LOCATION copy_source;
+  copy_source.pResource = depth_resource;
+  copy_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  copy_source.SubresourceIndex = 0;
+  deferred_command_list_.D3DCopyTextureRegion(&copy_dest, 0, 0, 0,
+                                              &copy_source, nullptr);
+  if (!AwaitAllQueueOperationsCompletion()) {
+    XELOGE("DIAG {}.{} HOSTDEPTH failed: awaiting the GPU",
+           diag::frame_dump_frame, event);
+    return;
+  }
+  D3D12_RANGE read_range;
+  read_range.Begin = 0;
+  read_range.End = SIZE_T(total_size);
+  void* mapping;
+  if (FAILED(diag_readback_buffer_->Map(0, &read_range, &mapping))) {
+    XELOGE("DIAG {}.{} HOSTDEPTH failed: Map", diag::frame_dump_frame,
+           event);
+    return;
+  }
+  // Statistics of the depth plane as 32-bit floats, over the rows of a 720p
+  // frame (or fewer).
+  uint32_t width = footprint.Footprint.Width;
+  uint32_t height = footprint.Footprint.Height;
+  uint32_t row_pitch = footprint.Footprint.RowPitch;
+  DXGI_FORMAT format = footprint.Footprint.Format;
+  uint32_t rows = std::min(height, uint32_t(720));
+  size_t texel_count = 0, zero_count = 0;
+  float depth_min = 1.0e30f, depth_max = -1.0e30f;
+  constexpr size_t kDistinctCap = 65536;
+  std::unordered_set<uint32_t> distinct;
+  if (row_pitch >= width * sizeof(uint32_t)) {
+    const uint8_t* bytes = static_cast<const uint8_t*>(mapping);
+    for (uint32_t y = 0; y < rows; ++y) {
+      const uint8_t* row = bytes + size_t(y) * row_pitch;
+      for (uint32_t x = 0; x < width; ++x) {
+        uint32_t bits;
+        std::memcpy(&bits, row + size_t(x) * sizeof(uint32_t),
+                    sizeof(uint32_t));
+        float value;
+        std::memcpy(&value, &bits, sizeof(float));
+        ++texel_count;
+        if (bits == 0) {
+          ++zero_count;
+        }
+        depth_min = std::min(depth_min, value);
+        depth_max = std::max(depth_max, value);
+        if (distinct.size() < kDistinctCap) {
+          distinct.insert(bits);
+        }
+      }
+    }
+  }
+  std::string file_name = fmt::format(
+      "f{}_e{}_hostdepth_{:08X}_{}x{}_p{}_f{}.bin", diag::frame_dump_frame,
+      event, depth_key, width, height, row_pitch, uint32_t(format));
+  bool file_written =
+      DiagWriteCaptureFile(file_name, mapping, size_t(total_size));
+  D3D12_RANGE write_range = {};
+  diag_readback_buffer_->Unmap(0, &write_range);
+  XELOGI(
+      "DIAG {}.{} HOSTDEPTH key={:08X} {}x{} pitch={} format={} rows={} "
+      "zero_share={:.4f} min={:.6f} max={:.6f} distinct={}{} file={}",
+      diag::frame_dump_frame, event, depth_key, width, height, row_pitch,
+      uint32_t(format), rows,
+      texel_count ? double(zero_count) / double(texel_count) : 0.0,
+      depth_min, depth_max, distinct.size(),
+      distinct.size() >= kDistinctCap ? "+" : "",
       file_written ? file_name : std::string("(write failed)"));
 }
 

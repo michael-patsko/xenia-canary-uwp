@@ -621,6 +621,15 @@ class RenderTargetCache {
   RenderTarget* PrepareFullEdram1280xRenderTargetForSnapshotRestoration(
       xenos::ColorRenderTargetFormat color_format);
 
+  // Diagnostic (harms-way-diag): the render target used by the draw with the
+  // last successful update, 0 being depth and 1...4 color, or nullptr.
+  RenderTarget* DiagLastUpdateUsedRenderTarget(uint32_t index) const {
+    if (index > xenos::kMaxColorRenderTargets) {
+      return nullptr;
+    }
+    return last_update_used_render_targets_[index];
+  }
+
   // For pixel shader interlock.
 
   virtual void RequestPixelShaderInterlockBarrier() {}

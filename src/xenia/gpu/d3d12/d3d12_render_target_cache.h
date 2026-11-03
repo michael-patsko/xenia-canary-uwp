@@ -88,6 +88,11 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
                D3D12TextureCache& texture_cache, uint32_t& written_address_out,
                uint32_t& written_length_out);
 
+  // Diagnostic (harms-way-diag): transitions the single-sampled depth render
+  // target used by the last draw to COPY_SOURCE and returns its resource, or
+  // returns nullptr if there's none or it's multisampled.
+  ID3D12Resource* DiagTransitionLastDepthForCopy();
+
   // Returns true if any downloads were submitted to the command processor.
   bool InitializeTraceSubmitDownloads();
   void InitializeTraceCompleteDownloads();
@@ -715,6 +720,22 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
   void DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
                          uint32_t dump_rows, uint32_t dump_pitch);
+
+  // Diagnostic (harms-way-diag) workaround, diag_dump_1x_depth_via_copy: copies
+  // the depth plane of a single-sampled depth render target through a buffer
+  // into an R32_FLOAT texture, and returns an SRV of that texture to dump from
+  // instead of the PlaneSlice 0 SRV of the render target.
+  bool DiagCopyDepthPlaneForDump(D3D12RenderTarget& render_target,
+                                 D3D12_CPU_DESCRIPTOR_HANDLE& srv_out);
+  Microsoft::WRL::ComPtr<ID3D12Resource> diag_depth_copy_buffer_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> diag_depth_copy_texture_;
+  D3D12_RESOURCE_STATES diag_depth_copy_buffer_state_ =
+      D3D12_RESOURCE_STATE_COPY_DEST;
+  D3D12_RESOURCE_STATES diag_depth_copy_texture_state_ =
+      D3D12_RESOURCE_STATE_COPY_DEST;
+  uint64_t diag_depth_copy_width_ = 0;
+  uint32_t diag_depth_copy_height_ = 0;
+  ui::d3d12::D3D12CpuDescriptorPool::Descriptor diag_depth_copy_srv_;
 
   bool use_stencil_reference_output_ = false;
 

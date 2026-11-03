@@ -34,6 +34,13 @@
 #include "xenia/ui/d3d12/d3d12_util.h"
 
 DEFINE_bool(
+    diag_dump_1x_depth_via_copy, false,
+    "Diagnostic (harms-way-diag): when dumping single-sampled depth render "
+    "targets for resolves, read the depth through a copy (depth plane to a "
+    "buffer to an R32_FLOAT texture) instead of the PlaneSlice 0 shader "
+    "resource view.",
+    "D3D12");
+DEFINE_bool(
     native_stencil_value_output_d3d12_intel, false,
     "Allow stencil reference output usage on Direct3D 12 on Intel GPUs - not "
     "working on UHD Graphics 630 as of March 2021 (driver 27.20.0100.8336).",
@@ -6460,6 +6467,160 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(
   return pipeline;
 }
 
+ID3D12Resource* D3D12RenderTargetCache::DiagTransitionLastDepthForCopy() {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return nullptr;
+  }
+  RenderTarget* render_target = DiagLastUpdateUsedRenderTarget(0);
+  if (!render_target ||
+      render_target->key().msaa_samples != xenos::MsaaSamples::k1X) {
+    return nullptr;
+  }
+  auto& d3d12_rt = *static_cast<D3D12RenderTarget*>(render_target);
+  command_processor_.PushTransitionBarrier(
+      d3d12_rt.resource(),
+      d3d12_rt.SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE),
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  return d3d12_rt.resource();
+}
+
+bool D3D12RenderTargetCache::DiagCopyDepthPlaneForDump(
+    D3D12RenderTarget& render_target, D3D12_CPU_DESCRIPTOR_HANDLE& srv_out) {
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  ID3D12Resource* source = render_target.resource();
+  D3D12_RESOURCE_DESC source_desc = source->GetDesc();
+  // Footprint of the depth plane (subresource 0).
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT depth_footprint;
+  UINT64 depth_total_size = 0;
+  device->GetCopyableFootprints(&source_desc, 0, 1, 0, &depth_footprint,
+                                nullptr, nullptr, &depth_total_size);
+  if (!depth_total_size) {
+    XELOGE("DIAG depth copy: no footprint for the depth plane");
+    return false;
+  }
+  if (!diag_depth_copy_texture_ ||
+      diag_depth_copy_width_ != source_desc.Width ||
+      diag_depth_copy_height_ != source_desc.Height) {
+    D3D12_RESOURCE_DESC texture_desc = {};
+    texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texture_desc.Alignment = 0;
+    texture_desc.Width = source_desc.Width;
+    texture_desc.Height = source_desc.Height;
+    texture_desc.DepthOrArraySize = 1;
+    texture_desc.MipLevels = 1;
+    texture_desc.Format = DXGI_FORMAT_R32_FLOAT;
+    texture_desc.SampleDesc.Count = 1;
+    texture_desc.SampleDesc.Quality = 0;
+    texture_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    texture_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    Microsoft::WRL::ComPtr<ID3D12Resource> texture;
+    if (FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE,
+            &texture_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&texture)))) {
+      XELOGE("DIAG depth copy: failed to create a {}x{} R32_FLOAT texture",
+             source_desc.Width, source_desc.Height);
+      return false;
+    }
+    D3D12_RESOURCE_DESC buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(buffer_desc, depth_total_size,
+                                            D3D12_RESOURCE_FLAG_NONE);
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    if (FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE,
+            &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&buffer)))) {
+      XELOGE("DIAG depth copy: failed to create a {} byte buffer",
+             depth_total_size);
+      return false;
+    }
+    if (!diag_depth_copy_srv_.IsValid()) {
+      diag_depth_copy_srv_ = descriptor_pool_srv_->AllocateDescriptor();
+      if (!diag_depth_copy_srv_.IsValid()) {
+        XELOGE("DIAG depth copy: failed to allocate an SRV descriptor");
+        return false;
+      }
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc;
+    srv_desc.Format = DXGI_FORMAT_R32_FLOAT;
+    srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv_desc.Texture2D.MostDetailedMip = 0;
+    srv_desc.Texture2D.MipLevels = 1;
+    srv_desc.Texture2D.PlaneSlice = 0;
+    srv_desc.Texture2D.ResourceMinLODClamp = 0.0f;
+    device->CreateShaderResourceView(texture.Get(), &srv_desc,
+                                     diag_depth_copy_srv_.GetHandle());
+    diag_depth_copy_texture_ = texture;
+    diag_depth_copy_buffer_ = buffer;
+    diag_depth_copy_texture_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
+    diag_depth_copy_buffer_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
+    diag_depth_copy_width_ = source_desc.Width;
+    diag_depth_copy_height_ = source_desc.Height;
+  }
+  // The buffer is copied to the R32_FLOAT texture with the texture's own
+  // footprint, which must have the same layout as the depth plane's.
+  D3D12_RESOURCE_DESC texture_desc = diag_depth_copy_texture_->GetDesc();
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT texture_footprint;
+  device->GetCopyableFootprints(&texture_desc, 0, 1, 0, &texture_footprint,
+                                nullptr, nullptr, nullptr);
+  if (texture_footprint.Footprint.RowPitch !=
+          depth_footprint.Footprint.RowPitch ||
+      texture_footprint.Footprint.Height != depth_footprint.Footprint.Height) {
+    XELOGE(
+        "DIAG depth copy: layout mismatch (depth plane format {} pitch {}, "
+        "R32_FLOAT pitch {})",
+        uint32_t(depth_footprint.Footprint.Format),
+        depth_footprint.Footprint.RowPitch,
+        texture_footprint.Footprint.RowPitch);
+    return false;
+  }
+  command_processor_.PushTransitionBarrier(
+      source, render_target.SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE),
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.PushTransitionBarrier(diag_depth_copy_buffer_.Get(),
+                                           diag_depth_copy_buffer_state_,
+                                           D3D12_RESOURCE_STATE_COPY_DEST);
+  diag_depth_copy_buffer_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
+  command_processor_.PushTransitionBarrier(diag_depth_copy_texture_.Get(),
+                                           diag_depth_copy_texture_state_,
+                                           D3D12_RESOURCE_STATE_COPY_DEST);
+  diag_depth_copy_texture_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
+  command_processor_.SubmitBarriers();
+  DeferredCommandList& command_list =
+      command_processor_.GetDeferredCommandList();
+  D3D12_TEXTURE_COPY_LOCATION copy_dest;
+  D3D12_TEXTURE_COPY_LOCATION copy_source;
+  copy_dest.pResource = diag_depth_copy_buffer_.Get();
+  copy_dest.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  copy_dest.PlacedFootprint = depth_footprint;
+  copy_source.pResource = source;
+  copy_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  copy_source.SubresourceIndex = 0;
+  command_list.D3DCopyTextureRegion(&copy_dest, 0, 0, 0, &copy_source,
+                                    nullptr);
+  command_processor_.PushTransitionBarrier(diag_depth_copy_buffer_.Get(),
+                                           D3D12_RESOURCE_STATE_COPY_DEST,
+                                           D3D12_RESOURCE_STATE_COPY_SOURCE);
+  diag_depth_copy_buffer_state_ = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  command_processor_.SubmitBarriers();
+  copy_dest.pResource = diag_depth_copy_texture_.Get();
+  copy_dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  copy_dest.SubresourceIndex = 0;
+  copy_source.pResource = diag_depth_copy_buffer_.Get();
+  copy_source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  copy_source.PlacedFootprint = texture_footprint;
+  command_list.D3DCopyTextureRegion(&copy_dest, 0, 0, 0, &copy_source,
+                                    nullptr);
+  command_processor_.PushTransitionBarrier(
+      diag_depth_copy_texture_.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  diag_depth_copy_texture_state_ =
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  srv_out = diag_depth_copy_srv_.GetHandle();
+  return true;
+}
+
 void D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base,
                                                uint32_t dump_row_length_used,
                                                uint32_t dump_rows,
@@ -6487,8 +6648,32 @@ void D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base,
   current_temporary_descriptors_cpu_.clear();
   bool any_sources_32bpp_64bpp[2] = {};
   uint32_t rt_sort_index = 0;
+  bool diag_depth_copy_used = false;
   for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
     auto& d3d12_rt = *static_cast<D3D12RenderTarget*>(rectangle.render_target);
+    D3D12_CPU_DESCRIPTOR_HANDLE diag_depth_copy_srv = {};
+    bool diag_use_depth_copy = false;
+    if (cvars::diag_dump_1x_depth_via_copy &&
+        d3d12_rt.temporary_srv_descriptor_index() == UINT32_MAX &&
+        d3d12_rt.key().is_depth &&
+        d3d12_rt.key().msaa_samples == xenos::MsaaSamples::k1X) {
+      if (diag_depth_copy_used) {
+        if (diag::frame_dump_active) {
+          XELOGI(
+              "DIAG {}   DUMP depth {:08X} read directly (copy slot in use)",
+              diag::frame_dump_frame, d3d12_rt.key().key);
+        }
+      } else {
+        diag_use_depth_copy =
+            DiagCopyDepthPlaneForDump(d3d12_rt, diag_depth_copy_srv);
+        diag_depth_copy_used = diag_use_depth_copy;
+        if (diag::frame_dump_active) {
+          XELOGI("DIAG {}   DUMP depth {:08X} read through a copy: {}",
+                 diag::frame_dump_frame, d3d12_rt.key().key,
+                 diag_use_depth_copy ? "yes" : "FAILED");
+        }
+      }
+    }
     command_processor_.PushTransitionBarrier(
         d3d12_rt.resource(),
         d3d12_rt.SetResourceState(
@@ -6501,7 +6686,8 @@ void D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base,
       d3d12_rt.SetTemporarySRVDescriptorIndex(
           uint32_t(current_temporary_descriptors_cpu_.size()));
       current_temporary_descriptors_cpu_.push_back(
-          d3d12_rt.descriptor_srv().GetHandle());
+          diag_use_depth_copy ? diag_depth_copy_srv
+                              : d3d12_rt.descriptor_srv().GetHandle());
     }
     RenderTargetKey rt_key = d3d12_rt.key();
     if (rt_key.is_depth &&
